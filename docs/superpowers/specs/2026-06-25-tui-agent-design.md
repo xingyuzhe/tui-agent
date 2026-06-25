@@ -73,7 +73,12 @@ tui-agent/
 │   ├── agent/
 │   │   ├── loop.ts                 # Agent Loop 核心（状态机）
 │   │   ├── session.ts              # 会话上下文管理（历史消息）
-│   │   └── types.ts                # Agent 相关类型定义
+│   │   ├── types.ts                # Agent 相关类型定义
+│   │   └── skills/
+│   │       ├── registry.ts         # Skill 注册与查找
+│   │       ├── loader.ts           # 读取并解析 skill markdown
+│   │       ├── types.ts            # Skill 类型定义
+│   │       └── builtin/            # 内置 Skill 文件（.md）
 │   │
 │   ├── tools/
 │   │   ├── registry.ts             # 工具注册与分发
@@ -372,6 +377,7 @@ interface ChatOptions {
 | 权限确认与拒绝 | `tests/tools/executor.test.ts` | 拒绝结果写入历史、拒绝后继续推理 |
 | 配置优先级 | `tests/config/loader.test.ts` | 项目级覆盖用户级、缺失字段使用默认值 |
 | Mock LLM Provider | `tests/providers/mock.test.ts` | 流式输出、tool_calls 解析、重试逻辑 |
+| Skills 系统 | `tests/agent/skills.test.ts` | 内置/项目级加载、同名覆盖、load_skill 工具执行 |
 
 ---
 
@@ -383,7 +389,101 @@ interface ChatOptions {
 
 ---
 
-## 十三、扩展方向（可选加分）
+## 十三、Skills 系统
+
+Skills 是 Agent 按需自主调用的行为规范文件。Agent 在推理过程中判断当前任务是否匹配某个 Skill，若匹配则读取该 Skill 的指导内容并注入上下文，按其步骤执行。
+
+### 工作流程
+
+```
+用户输入: "帮我做一次代码审查"
+         ↓
+  THINKING 状态 — LLM 推理
+         ↓ LLM 调用 load_skill("code-review")
+  SkillLoader 读取 .tui-agent/skills/code-review.md
+         ↓ 将 skill 内容以 system 消息注入会话上下文
+  THINKING 状态（继续推理，携带 Skill 指导）
+         ↓ 按照 Skill 定义的步骤调用工具、生成输出
+```
+
+### Skill 文件格式
+
+```markdown
+---
+name: code-review
+description: "对当前代码变更进行系统性代码审查，输出问题列表和建议"
+---
+
+# Code Review Skill
+
+## 执行步骤
+1. 用 run_shell("git diff HEAD") 获取当前变更
+2. 用 read_file 读取受影响的关键文件
+3. 检查以下维度：正确性、性能、安全、可读性
+4. 输出结构化报告：[严重程度] 文件:行号 — 问题描述
+```
+
+### Skill 加载机制
+
+- **启动时：** `SkillRegistry` 扫描两个位置的 Skill 文件：
+  1. `src/agent/skills/builtin/`（内置 Skills，随程序分发）
+  2. `<cwd>/.tui-agent/skills/`（项目级自定义 Skills）
+- **系统 Prompt：** 将所有已注册 Skill 的 `name + description` 列表注入系统 Prompt，让 LLM 知道哪些 Skill 可用
+- **按需加载：** LLM 通过调用内置工具 `load_skill(name)` 触发加载，Skill 内容以 `role: system` 消息注入当前会话上下文（不写入持久化历史）
+- **优先级：** 同名时项目级 Skill 覆盖内置 Skill
+
+### load_skill 工具定义
+
+```typescript
+{
+  name: 'load_skill',
+  description: '加载一个 Skill 的详细执行步骤到当前上下文，当任务复杂度需要结构化指导时使用',
+  parameters: {
+    name: { type: 'string', description: 'Skill 名称，来自已注册的 Skill 列表' }
+  },
+  type: 'readonly'   // 只读，无需用户确认
+}
+```
+
+### 内置 Skills 清单
+
+| Skill 名 | 触发场景描述 |
+|----------|------------|
+| `code-review` | 对代码变更进行系统性审查 |
+| `write-tests` | 为指定模块生成单元测试 |
+| `explain-code` | 解释代码逻辑并生成注释文档 |
+| `fix-bug` | 系统性排查并修复 bug |
+| `refactor` | 按最佳实践重构指定模块 |
+
+### 目录结构补充
+
+```
+src/agent/
+├── skills/
+│   ├── registry.ts          # Skill 注册与查找
+│   ├── loader.ts            # 读取并解析 skill markdown（含 frontmatter）
+│   ├── types.ts             # Skill 类型定义
+│   └── builtin/
+│       ├── code-review.md
+│       ├── write-tests.md
+│       ├── explain-code.md
+│       ├── fix-bug.md
+│       └── refactor.md
+
+.tui-agent/
+└── skills/                  # 项目级自定义 Skills（用户创建）
+```
+
+### 测试补充
+
+| 测试场景 | 测试文件 | 关键测试点 |
+|----------|----------|-----------|
+| Skill 注册与加载 | `tests/agent/skills.test.ts` | 内置/项目级加载、同名覆盖、frontmatter 解析 |
+| load_skill 工具执行 | `tests/agent/skills.test.ts` | Skill 不存在时的错误处理、注入上下文正确 |
+
+---
+
+## 十四、扩展方向（可选加分）
 
 - **上下文压缩：** 当会话历史超过 token 阈值时，自动压缩旧消息（摘要替代原文），保留工具调用结果
 - **历史搜索：** `/history <keyword>` 命令搜索历史对话
