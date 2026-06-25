@@ -361,8 +361,10 @@ interface ChatOptions {
 | `/model` | 查看当前模型名称 |
 | `/model <name>` | 切换到指定模型 |
 | `/status` | 查看 Agent 运行状态和配置摘要 |
+| `/context` | 强制刷新仓库上下文（重新读取 README / AGENT.md / git log） |
 | `/exit` | 退出程序（写入历史日志后退出） |
-| `Ctrl+C` | 同 `/exit` |
+| `Ctrl+C` 单次 | 中断当前 Agent 任务，回到 IDLE |
+| `Ctrl+C` 两次 | 退出程序 |
 
 ---
 
@@ -389,7 +391,211 @@ interface ChatOptions {
 
 ---
 
-## 十三、Skills 系统
+## 十三、数据模型
+
+所有跨模块传递的核心数据结构定义如下，作为整个项目的类型契约。
+
+### 消息类型（Message）
+
+```typescript
+// 用户消息
+interface UserMessage {
+  role: 'user'
+  content: string
+}
+
+// 助手消息（可含流式文本和/或工具调用）
+interface AssistantMessage {
+  role: 'assistant'
+  content: string          // 文本部分（流式累积后的完整内容）
+  tool_calls?: ToolCall[]  // 若有工具调用，列表非空
+}
+
+// 工具结果消息（每个 tool_call 对应一条）
+interface ToolResultMessage {
+  role: 'tool'
+  tool_call_id: string     // 关联 AssistantMessage 中的 ToolCall.id
+  name: string             // 工具名称
+  content: string          // 执行结果（成功输出或错误信息）
+}
+
+type Message = UserMessage | AssistantMessage | ToolResultMessage
+```
+
+### 工具调用（ToolCall）
+
+```typescript
+// LLM 请求执行的工具调用（存在于 AssistantMessage）
+interface ToolCall {
+  id: string               // LLM 生成的唯一 ID，用于关联 ToolResultMessage
+  name: string             // 工具函数名
+  arguments: string        // JSON 字符串，解析后得到工具参数
+}
+
+// 传给 LLM 的工具描述（区别于内部 Tool 接口）
+interface ToolDefinition {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: JSONSchema
+  }
+}
+```
+
+### 权限审批请求（PermissionRequest）
+
+```typescript
+// Agent Loop 传给 TUI 的待确认工具列表
+interface PermissionRequest {
+  items: PermissionItem[]
+}
+
+interface PermissionItem {
+  toolCall: ToolCall
+  tool: Tool               // 对应的工具实例，用于展示类型和参数摘要
+  decision?: 'allow' | 'deny'  // 用户决策（填写后返回给 Loop）
+}
+```
+
+### Agent 状态快照（AgentSnapshot）
+
+```typescript
+// useAgent hook 向 UI 暴露的只读状态
+interface AgentSnapshot {
+  state: AgentState
+  messages: Message[]          // 完整会话历史（渲染用）
+  streamingText: string        // 当前正在流式输出的文本（THINKING 状态时非空）
+  pendingPermission: PermissionRequest | null  // 待确认的权限请求
+  loopIteration: number        // 当前轮次
+  error: string | null         // ERROR 状态时的错误信息
+}
+```
+
+---
+
+## 十四、系统 Prompt 构造
+
+系统 Prompt 在每次对话请求前动态构造，由 `session.ts` 的 `buildSystemPrompt()` 负责生成。
+
+### 构成结构
+
+```
+[1] 角色定义
+[2] 当前环境信息（工作目录、时间、操作系统）
+[3] 仓库上下文（git 状态 + README 摘要，可选）
+[4] 可用工具说明（权限分类）
+[5] 可用 Skills 列表
+[6] 行为约束
+```
+
+### 各部分内容
+
+**[1] 角色定义（固定）**
+```
+你是一个终端编码助手（TUI Coding Agent）。你在用户的终端中运行，
+帮助用户完成代码库相关的开发任务。你可以读取文件、搜索代码、
+编辑文件和执行命令。你需要主动使用工具探索代码库来理解任务上下文，
+而不是依赖用户描述。
+```
+
+**[2] 环境信息（运行时注入）**
+```
+当前工作目录：/path/to/project
+当前时间：2026-06-25 18:00 CST
+操作系统：Windows 10 / macOS / Linux
+```
+
+**[3] 仓库上下文（启动时采集，可通过 /context 刷新）**
+- 读取项目根目录的 `README.md` 前 100 行
+- 读取 `AGENT.md` / `.tui-agent/context.md`（若存在，作为项目专属上下文）
+- 执行 `git log --oneline -5`（若为 git 仓库）
+- 若文件不存在，跳过，不报错
+
+**[4] 可用工具说明（从 ToolRegistry 动态生成）**
+```
+## 可用工具
+- 只读工具（自动执行，无需确认）：list_dir, read_file, search_files, load_skill
+- 危险工具（需要用户确认后执行）：write_file, edit_file, run_shell
+```
+
+**[5] 可用 Skills 列表（从 SkillRegistry 动态生成）**
+```
+## 可用 Skills（通过 load_skill 工具加载详细步骤）
+- code-review: 对当前代码变更进行系统性代码审查
+- write-tests: 为指定模块生成单元测试
+- ...
+```
+
+**[6] 行为约束（固定）**
+```
+## 行为约束
+- 执行危险操作前，通过工具调用触发用户确认，不要在文本中询问
+- 用户拒绝执行某操作时，将拒绝信息纳入推理上下文，调整方案继续
+- 单次任务循环不超过 {maxLoopIterations} 轮，超出时主动终止并说明原因
+- 不要编造文件内容，必须通过 read_file 工具读取后再引用
+```
+
+### 构造时机
+
+- **首次对话**：完整构造，含仓库上下文
+- **后续对话**：复用缓存的系统 Prompt（仓库上下文部分不重复抓取）
+- **`/context` 命令**：强制刷新仓库上下文部分
+- **`/model` 切换**：重新构造系统 Prompt（新模型可能有不同约束）
+
+---
+
+## 十五、中断 / 取消机制
+
+用户在任意非 IDLE 状态下可以中断当前 Agent 行为，中断是非破坏性的。
+
+### 触发方式
+
+| 触发 | 适用状态 | 行为 |
+|------|---------|------|
+| `Esc` 键 | THINKING / EXECUTING_TOOLS | 软中断：当前轮完成后停止（不中止已发出的请求） |
+| `Ctrl+C` 单次 | THINKING / EXECUTING_TOOLS | 硬中断：立即取消当前 LLM 请求 / 工具执行 |
+| `Ctrl+C` 两次（1s 内） | 任意状态 | 退出程序，写入日志后终止 |
+
+### 中断实现
+
+```typescript
+// AbortController 贯穿 Agent Loop
+class AgentLoop {
+  private abortController: AbortController | null = null
+
+  interrupt(hard: boolean) {
+    if (hard) {
+      this.abortController?.abort()  // 取消 LLM 请求 + 工具执行
+    } else {
+      this.softInterruptFlag = true  // 当前轮结束后检查此标志
+    }
+  }
+}
+```
+
+**AbortSignal 传递路径：**
+- `abortController.signal` → `ChatOptions.signal` → Provider 的 `fetch` 调用
+- `abortController.signal` → `run_shell` 的子进程 `AbortSignal`
+
+### 中断后的状态处理
+
+```
+硬中断发生时：
+  THINKING  → 丢弃未完成的流式文本 → 写入"[任务已取消]"消息 → IDLE
+  EXECUTING_TOOLS → 已完成的工具结果保留 → 未完成的工具标记为"已取消" → IDLE
+
+软中断发生时：
+  当前轮工具执行完毕 → 不进入下一轮 THINKING → 写入"[已暂停，等待指令]" → IDLE
+```
+
+### 与 AWAITING_PERMISSION 状态的关系
+
+- `AWAITING_PERMISSION` 状态下，`Esc` / `Ctrl+C` 等价于"全部拒绝"，将所有待确认工具标记为拒绝并写入历史，然后回到 `THINKING` 继续推理（而非退出）
+
+---
+
+## 十六、Skills 系统
 
 Skills 是 Agent 按需自主调用的行为规范文件。Agent 在推理过程中判断当前任务是否匹配某个 Skill，若匹配则读取该 Skill 的指导内容并注入上下文，按其步骤执行。
 
@@ -483,7 +689,7 @@ src/agent/
 
 ---
 
-## 十四、扩展方向（可选加分）
+## 十七、扩展方向（可选加分）
 
 - **上下文压缩：** 当会话历史超过 token 阈值时，自动压缩旧消息（摘要替代原文），保留工具调用结果
 - **历史搜索：** `/history <keyword>` 命令搜索历史对话
